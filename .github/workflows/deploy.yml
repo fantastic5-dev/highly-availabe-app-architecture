@@ -1,0 +1,86 @@
+name: Build and Deploy to EC2 via ASG
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    # Required for OIDC
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPOSITORY: aws-ha-platform-app
+      SSM_PARAMETER_NAME: /ha-platform/app/image-tag
+      ASG_NAME: aws-ha-platform-asg
+
+    steps:
+      # -----------------------------
+      # 1. Checkout source code
+      # -----------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------
+      # 2. Configure AWS credentials (OIDC)
+      # -----------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::730335228615:role/aws-ha-platform-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------
+      # 3. Login to Amazon ECR
+      # -----------------------------
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------
+      # 4. Build Docker image
+      # -----------------------------
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t $ECR_REPOSITORY:${{ github.sha }} \
+            ./app
+
+      # -----------------------------
+      # 5. Tag & Push Docker image to ECR
+      # -----------------------------
+      - name: Push Docker image to ECR
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          docker tag \
+            $ECR_REPOSITORY:${{ github.sha }} \
+            $ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/$ECR_REPOSITORY:${{ github.sha }}
+
+          docker push \
+            $ACCOUNT_ID.dkr.ecr.${AWS_REGION}.amazonaws.com/$ECR_REPOSITORY:${{ github.sha }}
+
+      # -----------------------------
+      # 6. Update SSM Parameter with image tag
+      # -----------------------------
+      - name: Update SSM image tag
+        run: |
+          aws ssm put-parameter \
+            --name "${SSM_PARAMETER_NAME}" \
+            --value "${{ github.sha }}" \
+            --type String \
+            --overwrite
+
+      # -----------------------------
+      # 7. Trigger ASG Instance Refresh
+      # -----------------------------
+      - name: Trigger ASG Instance Refresh
+        run: |
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${ASG_NAME}" \
+            --preferences MinHealthyPercentage=50
